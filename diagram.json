@@ -1,0 +1,61 @@
+{
+  "version": 1,
+  "author": "Natthanan POONNOTOK",
+  "editor": "wokwi",
+  "parts": [
+    { "type": "board-esp32-devkit-c-v4", "id": "esp", "top": 57.6, "left": 33.64, "attrs": {} },
+    {
+      "type": "wokwi-pushbutton",
+      "id": "btn1",
+      "top": -144.1,
+      "left": 80.3,
+      "rotate": 90,
+      "attrs": { "color": "blue", "xray": "1" }
+    },
+    {
+      "type": "wokwi-pushbutton",
+      "id": "btn2",
+      "top": -144.1,
+      "left": 137.9,
+      "rotate": 90,
+      "attrs": { "color": "red", "xray": "1" }
+    },
+    {
+      "type": "wokwi-pushbutton",
+      "id": "btn3",
+      "top": -144.1,
+      "left": 195.5,
+      "rotate": 90,
+      "attrs": { "color": "green", "xray": "1" }
+    },
+    {
+      "type": "wokwi-led",
+      "id": "led1",
+      "top": 159.6,
+      "left": -92.2,
+      "attrs": { "color": "red" }
+    },
+    {
+      "type": "wokwi-resistor",
+      "id": "r1",
+      "top": 244.25,
+      "left": -68.6,
+      "rotate": 180,
+      "attrs": { "value": "220" }
+    }
+  ],
+  "connections": [
+    [ "esp:TX", "$serialMonitor:RX", "", [] ],
+    [ "esp:RX", "$serialMonitor:TX", "", [] ],
+    [ "btn3:2.r", "esp:GND.2", "black", [ "v0" ] ],
+    [ "btn2:2.r", "esp:GND.2", "black", [ "v0" ] ],
+    [ "btn1:2.r", "esp:GND.2", "black", [ "v115.4", "h57.4", "v57.6" ] ],
+    [ "btn3:1.l", "esp:25", "green", [ "v-76.8", "h-230.4", "v384" ] ],
+    [ "btn2:1.l", "esp:26", "red", [ "v-57.6", "h-182.4", "v384" ] ],
+    [ "btn1:1.l", "esp:27", "blue", [ "v-38.4", "h-134.4", "v374.4" ] ],
+    [ "esp:12", "led1:A", "green", [ "v0" ] ],
+    [ "esp:GND.1", "r1:1", "black", [ "h-47.85" ] ],
+    [ "r1:2", "led1:C", "black", [ "v0", "h-8.4" ] ]
+  ],
+  "dependencies": {}
+}
