@@ -1,130 +1,213 @@
 #include <Arduino.h>
 #include <Wire.h>
-#include <math.h>
 #include <WiFi.h>
-#include <HTTPClient.h> // ไลบรารีสำหรับยิง HTTP POST
+#include <HTTPClient.h>
+#include <Natthanan123-project-1_inferencing.h> 
 
-// --- การตั้งค่า Hardware ---
-#define I2C_SDA 21
-#define I2C_SCL 22
-#define BUZZER_PIN 12
-#define MOTOR_PIN 14
+const char* ssid = "MM";
+const char* password = "12345678";
+const String serverName = "https://smart-fall-dashboard.vercel.app/api/events";
+const String deviceID = "ESP32_AI_MVP";
 const int MPU_ADDR = 0x68;
 
-// --- ⚠️ การตั้งค่า WiFi (แก้ไขให้ตรงกับเน็ตบ้าน/มือถือของคุณ) ⚠️ ---
-const char* ssid = "Just Me_2.4G";
-const char* password = "Pokemongo12";
+#define BUZZER_PIN 12
+#define MOTOR_PIN 14
 
-// URL สำหรับทดสอบรับข้อมูล (เดี๋ยวเราจะใช้เว็บจำลอง Backend กันก่อน)
-const String serverURL = "https://webhook.site/a1b36095-0334-4447-a63c-0335552c7436"; 
+TaskHandle_t SensorTaskHandle;
+TaskHandle_t AITaskHandle;
+TaskHandle_t WiFiTaskHandle;
+TaskHandle_t AlertTaskHandle; 
 
-// ตัวแปร Task
-TaskHandle_t TaskSensorRead;
-TaskHandle_t TaskAlert;
-TaskHandle_t TaskNetwork; // Task ใหม่!
+QueueHandle_t sensorQueue;
+SemaphoreHandle_t fallSemaphore;
+SemaphoreHandle_t serialMutex;
+
+struct SensorData {
+  float ax;
+  float ay;
+  float az;
+  float magnitude;
+};
+
+float currentMaxMagnitude = 0.0;
 
 void setupMPU() {
   Wire.beginTransmission(MPU_ADDR);
-  Wire.write(0x6B);  
-  Wire.write(0);     
-  Wire.endTransmission(true);
+  Wire.write(0x6B); Wire.write(0); Wire.endTransmission(true);
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x1C); Wire.write(0x08); Wire.endTransmission(true);
 }
 
-// 1. Task เซ็นเซอร์ (รันบน Core 1)
-void sensorReadTask(void *pvParameters) {
-  for(;;) {
+void connectWiFi() {
+  xSemaphoreTake(serialMutex, portMAX_DELAY);
+  Serial.print("Connecting to WiFi...");
+  xSemaphoreGive(serialMutex);
+  
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    vTaskDelay(pdMS_TO_TICKS(500));
+  }
+  
+  xSemaphoreTake(serialMutex, portMAX_DELAY);
+  Serial.println("\nWiFi Connected!");
+  xSemaphoreGive(serialMutex);
+}
+
+
+void vSensorTask(void *pvParameters) {
+  SensorData data;
+  TickType_t xLastWakeTime = xTaskGetTickCount();
+  const TickType_t xFrequency = pdMS_TO_TICKS(20);
+
+  for (;;) {
     Wire.beginTransmission(MPU_ADDR);
-    Wire.write(0x3B); 
-    Wire.endTransmission(false);
+    Wire.write(0x3B); Wire.endTransmission(false);
     Wire.requestFrom(MPU_ADDR, 6, true);  
     
     int16_t AcX = Wire.read()<<8 | Wire.read();  
     int16_t AcY = Wire.read()<<8 | Wire.read();  
     int16_t AcZ = Wire.read()<<8 | Wire.read();  
 
-    float ax = AcX / 16384.0; float ay = AcY / 16384.0; float az = AcZ / 16384.0;
-    float magnitude = sqrt(ax*ax + ay*ay + az*az);
+    data.ax = AcX / 8192.0;
+    data.ay = AcY / 8192.0;
+    data.az = AcZ / 8192.0;
+    data.magnitude = sqrt(data.ax*data.ax + data.ay*data.ay + data.az*data.az);
 
-    if (magnitude > 2.5 || magnitude < 0.4) {
-      Serial.printf("\n⚠️ FALL DETECTED! แรงกระแทก: %.2f G\n", magnitude);
-      
-      // ปลุก Task Alert ให้ร้องเตือน!
-      xTaskNotifyGive(TaskAlert); 
-      // ปลุก Task Network ให้ส่งข้อมูลขึ้นเน็ต!
-      xTaskNotifyGive(TaskNetwork); 
-      
-      vTaskDelay(4000 / portTICK_PERIOD_MS); 
-    }
-    vTaskDelay(50 / portTICK_PERIOD_MS); 
+    xQueueSend(sensorQueue, &data, 0);
+    vTaskDelayUntil(&xLastWakeTime, xFrequency);
   }
 }
 
-// 2. Task แจ้งเตือน (รันบน Core 1)
-void alertTask(void *pvParameters) {
-  for(;;) {
-    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-    for(int i=0; i<3; i++) {
-      digitalWrite(BUZZER_PIN, HIGH); digitalWrite(MOTOR_PIN, HIGH);
-      vTaskDelay(150 / portTICK_PERIOD_MS);
-      digitalWrite(BUZZER_PIN, LOW); digitalWrite(MOTOR_PIN, LOW);
-      vTaskDelay(150 / portTICK_PERIOD_MS);
-    }
-  }
-}
+void vAITask(void *pvParameters) {
+  SensorData data;
+  float features[EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE];
+  int feature_ix = 0;
+  float maxMagInWindow = 0.0;
 
-// 3. Task เน็ตเวิร์ก (รันบน Core 0)
-void networkTask(void *pvParameters) {
-  // เชื่อมต่อ WiFi ครั้งแรกเมื่อเปิดเครื่อง
-  Serial.print("Connecting to WiFi");
-  WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED) {
-    vTaskDelay(500 / portTICK_PERIOD_MS);
-    Serial.print(".");
-  }
-  Serial.println("\n🌐 WiFi Connected!");
-  Serial.print("IP Address: "); Serial.println(WiFi.localIP());
-
-  for(;;) {
-    // หลับรอจนกว่าเซ็นเซอร์จะปลุก (ประหยัดพลังงาน)
-    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-
-    if(WiFi.status() == WL_CONNECTED){
-      HTTPClient http;
-      http.begin(serverURL);
-      http.addHeader("Content-Type", "application/json");
-
-      // สร้างข้อมูล JSON (เตรียมพร้อมส่งเข้า MongoDB ในอนาคต)
-      String jsonPayload = "{\"device_id\":\"ESP32_MVP_01\", \"status\":\"FALL_DETECTED\", \"magnitude\":\"HIGH\"}";
-
-      Serial.println("🌐 กำลังส่งข้อมูลขึ้น Server...");
-      int httpResponseCode = http.POST(jsonPayload); // ยิงข้อมูล!
-
-      if (httpResponseCode > 0) {
-        Serial.printf("✅ ส่งสำเร็จ! HTTP Response: %d\n", httpResponseCode);
-      } else {
-        Serial.printf("❌ ส่งไม่สำเร็จ! Error: %s\n", http.errorToString(httpResponseCode).c_str());
+  for (;;) {
+    if (xQueueReceive(sensorQueue, &data, portMAX_DELAY) == pdPASS) {
+      features[feature_ix++] = data.ax;
+      features[feature_ix++] = data.ay;
+      features[feature_ix++] = data.az;
+      
+      if (data.magnitude > maxMagInWindow) {
+        maxMagInWindow = data.magnitude;
       }
-      http.end();
-    } else {
-      Serial.println("❌ ไม่สามารถส่งได้ เพราะ WiFi หลุด");
+
+      if (feature_ix >= EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE) {
+        feature_ix = 0; 
+
+        signal_t signal;
+        numpy::signal_from_buffer(features, EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE, &signal);
+        
+        ei_impulse_result_t result = { 0 };
+        run_classifier(&signal, &result, false);
+
+        for (uint16_t i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
+          String label = String(result.classification[i].label);
+          float value = result.classification[i].value;
+
+          if (label == "fall" && value >= 0.80) {
+            xSemaphoreTake(serialMutex, portMAX_DELAY);
+            Serial.print("FALL DETECTED! Conf: "); Serial.print(value * 100); Serial.println("%");
+            xSemaphoreGive(serialMutex);
+
+            currentMaxMagnitude = maxMagInWindow;
+            
+            xSemaphoreGive(fallSemaphore);
+            xTaskNotifyGive(AlertTaskHandle);
+          }
+        }
+        maxMagInWindow = 0.0;
+      }
+    }
+  }
+}
+
+
+void vAlertTask(void *pvParameters) {
+  for (;;) {
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+    xSemaphoreTake(serialMutex, portMAX_DELAY);
+    Serial.println("🔊 Alert Task ตื่นแล้ว! สั่งเปิด Buzzer และ Motor!");
+    xSemaphoreGive(serialMutex);
+    
+    for(int i = 0; i < 10; i++) {
+      digitalWrite(BUZZER_PIN, HIGH);
+      digitalWrite(MOTOR_PIN, HIGH);
+      vTaskDelay(150 / portTICK_PERIOD_MS); 
+      
+      digitalWrite(BUZZER_PIN, LOW);
+      digitalWrite(MOTOR_PIN, LOW);
+      vTaskDelay(150 / portTICK_PERIOD_MS);
+    }
+  }
+}
+
+
+void vWiFiTask(void *pvParameters) {
+  const TickType_t cooldownTime = pdMS_TO_TICKS(10000);
+
+  for (;;) {
+    if (xSemaphoreTake(fallSemaphore, portMAX_DELAY) == pdPASS) {
+      
+      if (WiFi.status() == WL_CONNECTED) {
+        HTTPClient http;
+        http.begin(serverName);
+        http.addHeader("Content-Type", "application/json");
+
+        String jsonPayload = "{\"device_id\":\"" + deviceID + "\",";
+        jsonPayload += "\"magnitude\":" + String(currentMaxMagnitude, 2) + ",";
+        jsonPayload += "\"status\":\"UNACKNOWLEDGED\"}";
+
+        int httpResponseCode = http.POST(jsonPayload);
+        
+        xSemaphoreTake(serialMutex, portMAX_DELAY);
+        if (httpResponseCode > 0) {
+          Serial.print("Web Alert Sent! Code: "); Serial.println(httpResponseCode);
+        } else {
+          Serial.print("Send Error: "); Serial.println(httpResponseCode);
+        }
+        xSemaphoreGive(serialMutex);
+        http.end();
+      } else {
+        connectWiFi();
+      }
+
+      vTaskDelay(cooldownTime);
+      xSemaphoreTake(fallSemaphore, 0); 
     }
   }
 }
 
 void setup() {
   Serial.begin(115200);
-  pinMode(BUZZER_PIN, OUTPUT); pinMode(MOTOR_PIN, OUTPUT);
-  Wire.begin(I2C_SDA, I2C_SCL);
+  Wire.begin(21, 22);
+  
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(MOTOR_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+  digitalWrite(MOTOR_PIN, LOW);
+
   setupMPU();
   
-  // จัดสรร Core ในการรัน Task
-  xTaskCreatePinnedToCore(sensorReadTask, "Sensor", 4096, NULL, 1, &TaskSensorRead, 1); // Core 1
-  xTaskCreatePinnedToCore(alertTask, "Alert", 2048, NULL, 2, &TaskAlert, 1);        // Core 1
-  
-  // ให้อินเทอร์เน็ตไปรันที่ Core 0 เพื่อไม่ให้แย่งทรัพยากรเซ็นเซอร์
-  xTaskCreatePinnedToCore(networkTask, "Network", 8192, NULL, 0, &TaskNetwork, 0);  // Core 0
+  serialMutex = xSemaphoreCreateMutex();
+  fallSemaphore = xSemaphoreCreateBinary();
+  sensorQueue = xQueueCreate(10, sizeof(SensorData));
+
+  connectWiFi();
+
+  xTaskCreatePinnedToCore(vSensorTask, "Sensor Task", 4096, NULL, 3, &SensorTaskHandle, 1);
+  xTaskCreatePinnedToCore(vAITask,     "AI Task",     8192, NULL, 2, &AITaskHandle,     1);
+  xTaskCreatePinnedToCore(vWiFiTask,   "WiFi Task",   8192, NULL, 1, &WiFiTaskHandle,   0);
+  xTaskCreatePinnedToCore(vAlertTask,  "Alert Task",  2048, NULL, 4, &AlertTaskHandle,  0);
+
+  xSemaphoreTake(serialMutex, portMAX_DELAY);
+  Serial.println("FreeRTOS Master Scheduler Started! Ready for AI Fall Detection.");
+  xSemaphoreGive(serialMutex);
 }
 
 void loop() {
-  vTaskDelay(1000 / portTICK_PERIOD_MS);
+  vTaskDelete(NULL); 
 }
